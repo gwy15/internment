@@ -45,6 +45,7 @@ bench = ["arc", "arc-interner", "arena", "memorable-wordlist", "append-only-vec"
 arena = []
 intern = []
 default = ["intern"]
+dst = []
 
 [dev-dependencies]
 

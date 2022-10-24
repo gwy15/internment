@@ -44,56 +44,89 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// assert_eq!(&*x, "hello"); // dereference an ArcIntern like a pointer
 /// ```
 #[cfg_attr(docsrs, doc(cfg(feature = "arc")))]
-pub struct ArcIntern<T: Eq + Hash + Send + Sync + 'static> {
+pub struct ArcIntern<T: ?Sized + Eq + Hash + Send + Sync + 'static> {
     pointer: std::ptr::NonNull<RefCount<T>>,
 }
 
-unsafe impl<T: Eq + Hash + Send + Sync> Send for ArcIntern<T> {}
-unsafe impl<T: Eq + Hash + Send + Sync> Sync for ArcIntern<T> {}
+unsafe impl<T: ?Sized + Eq + Hash + Send + Sync> Send for ArcIntern<T> {}
+unsafe impl<T: ?Sized + Eq + Hash + Send + Sync> Sync for ArcIntern<T> {}
 
 #[derive(Debug)]
-struct RefCount<T> {
+struct RefCount<T: ?Sized> {
     count: AtomicUsize,
     data: T,
 }
-impl<T: Eq> Eq for RefCount<T> {}
-impl<T: PartialEq> PartialEq for RefCount<T> {
+
+#[cfg(feature = "dst")]
+impl<T: Copy> RefCount<[T]> {
+    fn from_slice(slice: &[T]) -> Box<RefCount<[T]>> {
+        use std::alloc::{Allocator, Layout};
+        let layout = Layout::new::<RefCount<()>>()
+            .extend(Layout::array::<T>(slice.len()).unwrap())
+            .unwrap()
+            .0
+            .pad_to_align();
+        let ptr = std::alloc::Global.allocate_zeroed(layout).unwrap();
+        let ptr = std::ptr::slice_from_raw_parts_mut(ptr.as_ptr() as *mut T, slice.len())
+            as *mut RefCount<[T]>;
+        let mut this = unsafe { Box::from_raw(ptr) };
+
+        this.count = AtomicUsize::new(1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), &mut this.data[0] as *mut T, slice.len())
+        };
+        this
+    }
+}
+#[cfg(feature = "dst")]
+impl RefCount<str> {
+    fn from_str(s: &str) -> Box<RefCount<str>> {
+        let bytes = s.as_bytes();
+        let boxed_refcount = RefCount::<[u8]>::from_slice(bytes);
+        debug_assert_eq!(s.len(), boxed_refcount.data.len());
+
+        unsafe { Box::from_raw(Box::into_raw(boxed_refcount) as *mut RefCount<str>) }
+    }
+}
+
+impl<T: ?Sized + Eq> Eq for RefCount<T> {}
+impl<T: ?Sized + PartialEq> PartialEq for RefCount<T> {
     fn eq(&self, other: &Self) -> bool {
         self.data == other.data
     }
 }
-impl<T: Hash> Hash for RefCount<T> {
+impl<T: ?Sized + Hash> Hash for RefCount<T> {
     fn hash<H: Hasher>(&self, hasher: &mut H) {
         self.data.hash(hasher)
     }
 }
 
 #[derive(Eq, PartialEq, Hash)]
-struct BoxRefCount<T>(Box<RefCount<T>>);
-
+struct BoxRefCount<T: ?Sized>(Box<RefCount<T>>);
 impl<T> BoxRefCount<T> {
     fn into_inner(self) -> T {
         self.0.data
     }
 }
-impl<T> Borrow<T> for BoxRefCount<T> {
+
+impl<T: ?Sized> Borrow<T> for BoxRefCount<T> {
     fn borrow(&self) -> &T {
         &self.0.data
     }
 }
-impl<T> Borrow<RefCount<T>> for BoxRefCount<T> {
+impl<T: ?Sized> Borrow<RefCount<T>> for BoxRefCount<T> {
     fn borrow(&self) -> &RefCount<T> {
         &self.0
     }
 }
-impl<T> Deref for BoxRefCount<T> {
+impl<T: ?Sized> Deref for BoxRefCount<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         &self.0.data
     }
 }
 
-impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     fn get_pointer(&self) -> *const RefCount<T> {
         self.pointer.as_ptr()
     }
@@ -112,6 +145,92 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
         };
         boxed
     }
+
+    /// Intern a value from a reference with atomic reference counting.
+    ///
+    /// If this value has not previously been
+    /// interned, then `new` will allocate a spot for the value on the
+    /// heap and generate that value using `T::from(val)`.
+    pub fn from_ref<'a, Q: ?Sized + Eq + Hash + 'a>(val: &'a Q) -> ArcIntern<T>
+    where
+        T: Borrow<Q> + From<&'a Q>,
+    {
+        // No reference only fast-path as
+        // the trait `std::borrow::Borrow<Q>` is not implemented for `Arc<T>`
+        Self::new(val.into())
+    }
+    /// See how many objects have been interned.  This may be helpful
+    /// in analyzing memory use.
+    pub fn num_objects_interned() -> usize {
+        let c = Self::get_container();
+        c.downcast_ref::<Container<T>>()
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+    /// Return the number of counts for this pointer.
+    pub fn refcount(&self) -> usize {
+        unsafe { self.pointer.as_ref().count.load(Ordering::Acquire) }
+    }
+
+    /// Only for benchmarking, this will cause problems
+    #[cfg(feature = "bench")]
+    pub fn benchmarking_only_clear_interns() {}
+
+    /// make new [`ArcIntern`] with copyable initial value, like `&str` or `&[u8]`.
+    fn new_with_copyable_init_val<I, NewFn>(val: &I, new_fn: NewFn) -> ArcIntern<T>
+    where
+        I: ?Sized + Hash + std::cmp::Eq,
+        BoxRefCount<T>: Borrow<I>,
+        NewFn: Fn(&I) -> Box<RefCount<T>>,
+    {
+        // cache the converted BoxRefCount
+        let mut converted = None;
+        loop {
+            let c = Self::get_container();
+            let m = c.downcast_ref::<Container<T>>().unwrap();
+
+            if let Some(b) = m.get_mut(val) {
+                let b = b.key();
+                // First increment the count.  We are holding the write mutex here.
+                // Has to be the write mutex to avoid a race
+                let oldval = b.0.count.fetch_add(1, Ordering::SeqCst);
+                if oldval != 0 {
+                    // we can only use this value if the value is not about to be freed
+                    return ArcIntern {
+                        pointer: std::ptr::NonNull::from(b.0.borrow()),
+                    };
+                } else {
+                    // we have encountered a race condition here.
+                    // we will just wait for the object to finish
+                    // being freed.
+                    b.0.count.fetch_sub(1, Ordering::SeqCst);
+                }
+            } else {
+                let b = std::mem::take(&mut converted).unwrap_or_else(|| new_fn(val));
+                match m.entry(BoxRefCount(b)) {
+                    Entry::Vacant(e) => {
+                        // We can insert, all is good
+                        let p = ArcIntern {
+                            pointer: std::ptr::NonNull::from(e.key().0.borrow()),
+                        };
+                        e.insert(());
+                        return p;
+                    }
+                    Entry::Occupied(e) => {
+                        // Race, map already has data, go round again
+                        let box_ref_count = e.into_key();
+                        converted = Some(box_ref_count.0);
+                    }
+                }
+            }
+            // yield so that the object can finish being freed,
+            // and then we will be able to intern a new copy.
+            std::thread::yield_now();
+        }
+    }
+}
+
+impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     /// Intern a value.  If this value has not previously been
     /// interned, then `new` will allocate a spot for the value on the
     /// heap.  Otherwise, it will return a pointer to the object
@@ -165,35 +284,6 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
             std::thread::yield_now();
         }
     }
-    /// Intern a value from a reference with atomic reference counting.
-    ///
-    /// If this value has not previously been
-    /// interned, then `new` will allocate a spot for the value on the
-    /// heap and generate that value using `T::from(val)`.
-    pub fn from_ref<'a, Q: ?Sized + Eq + Hash + 'a>(val: &'a Q) -> ArcIntern<T>
-    where
-        T: Borrow<Q> + From<&'a Q>,
-    {
-        // No reference only fast-path as
-        // the trait `std::borrow::Borrow<Q>` is not implemented for `Arc<T>`
-        Self::new(val.into())
-    }
-    /// See how many objects have been interned.  This may be helpful
-    /// in analyzing memory use.
-    pub fn num_objects_interned() -> usize {
-        let c = Self::get_container();
-        c.downcast_ref::<Container<T>>()
-            .map(|m| m.len())
-            .unwrap_or(0)
-    }
-    /// Return the number of counts for this pointer.
-    pub fn refcount(&self) -> usize {
-        unsafe { self.pointer.as_ref().count.load(Ordering::Acquire) }
-    }
-
-    /// Only for benchmarking, this will cause problems
-    #[cfg(feature = "bench")]
-    pub fn benchmarking_only_clear_interns() {}
 }
 
 impl<T: Eq + Hash + Send + Sync + 'static> Clone for ArcIntern<T> {
@@ -217,7 +307,7 @@ fn yield_on_tests() {
     std::thread::yield_now();
 }
 
-impl<T: Eq + Hash + Send + Sync> Drop for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync> Drop for ArcIntern<T> {
     fn drop(&mut self) {
         // (Quoting from std::sync::Arc again): Because `fetch_sub` is
         // already atomic, we do not need to synchronize with other
@@ -251,26 +341,26 @@ impl<T: Eq + Hash + Send + Sync> Drop for ArcIntern<T> {
     }
 }
 
-impl<T: Send + Sync + Hash + Eq> AsRef<T> for ArcIntern<T> {
+impl<T: ?Sized + Send + Sync + Hash + Eq> AsRef<T> for ArcIntern<T> {
     fn as_ref(&self) -> &T {
         unsafe { &self.pointer.as_ref().data }
     }
 }
 
-impl<T: Eq + Hash + Send + Sync> Deref for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync> Deref for ArcIntern<T> {
     type Target = T;
     fn deref(&self) -> &T {
         self.as_ref()
     }
 }
 
-impl<T: Eq + Hash + Send + Sync + Display> Display for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync + Display> Display for ArcIntern<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         self.deref().fmt(f)
     }
 }
 
-impl<T: Eq + Hash + Send + Sync> Pointer for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync> Pointer for ArcIntern<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         Pointer::fmt(&self.get_pointer(), f)
     }
@@ -281,20 +371,20 @@ impl<T: Eq + Hash + Send + Sync> Pointer for ArcIntern<T> {
 /// be irrelevant, since there is a unique pointer for every
 /// value, but it *is* observable, since you could compare the
 /// hash of the pointer with hash of the data itself.
-impl<T: Eq + Hash + Send + Sync> Hash for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync> Hash for ArcIntern<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.get_pointer().hash(state);
     }
 }
 
-impl<T: Eq + Hash + Send + Sync> PartialEq for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync> PartialEq for ArcIntern<T> {
     fn eq(&self, other: &Self) -> bool {
         self.get_pointer() == other.get_pointer()
     }
 }
-impl<T: Eq + Hash + Send + Sync> Eq for ArcIntern<T> {}
+impl<T: ?Sized + Eq + Hash + Send + Sync> Eq for ArcIntern<T> {}
 
-impl<T: Eq + Hash + Send + Sync + PartialOrd> PartialOrd for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync + PartialOrd> PartialOrd for ArcIntern<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.as_ref().partial_cmp(other)
     }
@@ -311,7 +401,7 @@ impl<T: Eq + Hash + Send + Sync + PartialOrd> PartialOrd for ArcIntern<T> {
         self.as_ref().ge(other)
     }
 }
-impl<T: Eq + Hash + Send + Sync + Ord> Ord for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync + Ord> Ord for ArcIntern<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.as_ref().cmp(other)
     }
@@ -319,7 +409,7 @@ impl<T: Eq + Hash + Send + Sync + Ord> Ord for ArcIntern<T> {
 
 #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 #[cfg(feature = "serde")]
-impl<T: Eq + Hash + Send + Sync + Serialize> Serialize for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync + Serialize> Serialize for ArcIntern<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.as_ref().serialize(serializer)
     }
@@ -330,6 +420,7 @@ impl<T: Eq + Hash + Send + Sync + 'static> From<T> for ArcIntern<T> {
         ArcIntern::new(t)
     }
 }
+
 impl<T: Eq + Hash + Send + Sync + Default + 'static> Default for ArcIntern<T> {
     fn default() -> Self {
         ArcIntern::new(Default::default())
@@ -338,11 +429,132 @@ impl<T: Eq + Hash + Send + Sync + Default + 'static> Default for ArcIntern<T> {
 
 #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 #[cfg(feature = "serde")]
-impl<'de, T: Eq + Hash + Send + Sync + 'static + Deserialize<'de>> Deserialize<'de>
+impl<'de, T: ?Sized + Eq + Hash + Send + Sync + 'static + Deserialize<'de>> Deserialize<'de>
     for ArcIntern<T>
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         T::deserialize(deserializer).map(|x: T| Self::new(x))
+    }
+}
+
+#[cfg(feature = "dst")]
+mod dst {
+    use super::*;
+    impl From<&str> for ArcIntern<str> {
+        fn from(s: &str) -> Self {
+            ArcIntern::<str>::new_with_copyable_init_val(s, |s| RefCount::<str>::from_str(s))
+        }
+    }
+    impl From<String> for ArcIntern<str> {
+        fn from(s: String) -> Self {
+            Self::from(&s[..])
+        }
+    }
+    impl From<Box<str>> for ArcIntern<str> {
+        fn from(s: Box<str>) -> Self {
+            Self::from(&s[..])
+        }
+    }
+    impl Default for ArcIntern<str> {
+        fn default() -> Self {
+            Self::from("")
+        }
+    }
+
+    impl<T> From<&[T]> for ArcIntern<[T]>
+    where
+        T: Copy + Send + Sync + Hash + Eq + 'static,
+    {
+        fn from(slice: &[T]) -> Self {
+            ArcIntern::<[T]>::new_with_copyable_init_val(slice, |slice| {
+                RefCount::<[T]>::from_slice(slice)
+            })
+        }
+    }
+    // NOTE: we can do better by removing the `Copy` bound and
+    // copying the data without dropping `T`. See [`std::sync::Arc::from_box`]
+    impl<T> From<Vec<T>> for ArcIntern<[T]>
+    where
+        T: Copy + Send + Sync + Hash + Eq + 'static,
+    {
+        fn from(vec: Vec<T>) -> Self {
+            Self::from(&vec[..])
+        }
+    }
+    // NOTE: we can do better by removing the `Copy` bound and
+    // copying the data without dropping `T`. See [`std::sync::Arc::from_box`]
+    impl<T> From<Box<[T]>> for ArcIntern<[T]>
+    where
+        T: Copy + Send + Sync + Hash + Eq + 'static,
+    {
+        fn from(boxed_slice: Box<[T]>) -> Self {
+            Self::from(&boxed_slice[..])
+        }
+    }
+    impl<T> Default for ArcIntern<[T]>
+    where
+        T: Copy + Send + Sync + Hash + Eq + 'static,
+    {
+        fn default() -> Self {
+            Self::from(&[][..])
+        }
+    }
+
+    #[test]
+    fn dst_arc_intern_is_sized() {
+        struct _Assure
+        where
+            ArcIntern<str>: Sized;
+        struct _Assure2
+        where
+            ArcIntern<[u8]>: Sized;
+    }
+
+    #[test]
+    fn dst_arc_intern_is_hash() {
+        struct _Assure
+        where
+            ArcIntern<str>: Hash;
+    }
+
+    #[test]
+    fn dst_arc_intern_is_send_and_sync() {
+        struct _Assure
+        where
+            ArcIntern<str>: Send + Sync;
+    }
+
+    #[test]
+    fn arc_intern_str() {
+        let x: ArcIntern<str> = ArcIntern::from("hello");
+        assert_eq!(x.len(), 5);
+        assert_eq!(x.refcount(), 1);
+
+        let y: ArcIntern<str> = ArcIntern::from("hello");
+        assert_eq!(x.refcount(), 2);
+        assert_eq!(y.refcount(), 2);
+
+        assert_eq!(x.as_ptr(), y.as_ptr());
+        assert_eq!(x, y);
+
+        let z: ArcIntern<str> = ArcIntern::from(String::from("hello"));
+        assert_eq!(x.refcount(), 3);
+        assert_eq!(y.refcount(), 3);
+        assert_eq!(z.refcount(), 3);
+    }
+
+    #[test]
+    fn zst_for_dst() {
+        let vec = vec![(); 500];
+        let x: ArcIntern<[()]> = ArcIntern::from(vec.clone());
+        assert_eq!(x.len(), 500);
+        assert_eq!(x.refcount(), 1);
+
+        let y: ArcIntern<[()]> = ArcIntern::from(vec);
+        assert_eq!(x.refcount(), 2);
+        assert_eq!(y.refcount(), 2);
+
+        assert_eq!(x, y);
     }
 }
 
@@ -430,7 +642,7 @@ fn test_arcintern_nested_drop() {
     let _one = ArcIntern::new(Nat::Successor(zero));
 }
 
-impl<T: Eq + Hash + Send + Sync + Debug> Debug for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync + Debug> Debug for ArcIntern<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         Pointer::fmt(&self.pointer, f)?;
         f.write_str(" : ")?;

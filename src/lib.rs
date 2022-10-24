@@ -1,4 +1,5 @@
 #![deny(missing_docs)]
+#![cfg_attr(all(feature = "dst", feature = "arc"), feature(allocator_api))]
 // Copyright 2018,2020 David Roundy
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
@@ -32,7 +33,7 @@
 //! defined by `Eq` and `Hash`) will correspond to a single pointer value.  This
 //! means that we can use pointer comparison (and a pointer hash) in place of value
 //! comparisons, which is very fast.
-//! 
+//!
 //! # Example
 //! ```rust
 //! use internment::Intern;
@@ -71,7 +72,6 @@ pub use arena::Arena;
 
 #[cfg(feature = "arena")]
 pub use arena::ArenaIntern;
-
 
 #[cfg(feature = "arc")]
 mod arc;
