@@ -429,8 +429,9 @@ impl<T: Eq + Hash + Send + Sync + Default + 'static> Default for ArcIntern<T> {
 
 #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 #[cfg(feature = "serde")]
-impl<'de, T: ?Sized + Eq + Hash + Send + Sync + 'static + Deserialize<'de>> Deserialize<'de>
-    for ArcIntern<T>
+impl<'de, T> Deserialize<'de> for ArcIntern<T>
+where
+    T: Eq + Hash + Send + Sync + 'static + Deserialize<'de>,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         T::deserialize(deserializer).map(|x: T| Self::new(x))
@@ -500,6 +501,69 @@ mod dst {
         }
     }
 
+    // implement some useful equal comparisons
+    macro_rules! impl_eq {
+        ([$($vars:tt)*] $lhs:ty, $rhs: ty) => {
+            #[allow(unused_lifetimes)]
+            impl<'a, $($vars)*> PartialEq<$rhs> for $lhs {
+                #[inline]
+                fn eq(&self, other: &$rhs) -> bool {
+                    PartialEq::eq(&self[..], &other[..])
+                }
+                #[inline]
+                fn ne(&self, other: &$rhs) -> bool {
+                    PartialEq::ne(&self[..], &other[..])
+                }
+            }
+
+            #[allow(unused_lifetimes)]
+            impl<'a, $($vars)*> PartialEq<$lhs> for $rhs {
+                #[inline]
+                fn eq(&self, other: &$lhs) -> bool {
+                    PartialEq::eq(&self[..], &other[..])
+                }
+                #[inline]
+                fn ne(&self, other: &$lhs) -> bool {
+                    PartialEq::ne(&self[..], &other[..])
+                }
+            }
+        };
+    }
+    impl_eq! { [] ArcIntern<str>, str }
+    impl_eq! { [] ArcIntern<str>, &'a str }
+    impl_eq! { [] ArcIntern<str>, String }
+    impl_eq! { [] ArcIntern<str>, std::borrow::Cow<'a, str> }
+    impl_eq! { [] ArcIntern<str>, Box<str> }
+    impl_eq! { [] ArcIntern<str>, std::rc::Rc<str> }
+    impl_eq! { [] ArcIntern<str>, std::sync::Arc<str> }
+    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, Vec<T> }
+    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, [T] }
+    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, &'a [T] }
+    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, &'a mut [T] }
+    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, std::borrow::Cow<'a, [T]> }
+    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, Box<[T]> }
+    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, std::rc::Rc<[T]> }
+    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, std::sync::Arc<[T]> }
+    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static, const N: usize] ArcIntern<[T]>, [T; N] }
+    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static, const N: usize] ArcIntern<[T]>, &[T; N] }
+
+    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+    #[cfg(feature = "serde")]
+    impl<'de: 'a, 'a> Deserialize<'de> for ArcIntern<str> {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let s: &'a str = <&str as Deserialize>::deserialize(deserializer)?;
+            Ok(Self::from(s))
+        }
+    }
+    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+    #[cfg(feature = "serde")]
+    impl<'de: 'a, 'a> Deserialize<'de> for ArcIntern<[u8]> {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let slice = <&'a [u8] as Deserialize>::deserialize(deserializer)?;
+            Ok(Self::from(slice))
+        }
+    }
+
     #[test]
     fn dst_arc_intern_is_sized() {
         struct _Assure
@@ -522,6 +586,31 @@ mod dst {
         struct _Assure
         where
             ArcIntern<str>: Send + Sync;
+    }
+
+    #[test]
+    fn common_equal_comparisons() {
+        let s1: ArcIntern<str> = ArcIntern::from("hello");
+        let s2: &str = "hello";
+        assert_eq!(s1, s2);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserialize_arc_intern_str() {
+        let s = "\"a\"";
+        let mut deserializer = serde_json::Deserializer::from_str(s);
+        let s = <ArcIntern<str> as serde::Deserialize>::deserialize(&mut deserializer).unwrap();
+        assert_eq!(s, "a");
+        assert_eq!("a", s);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serialize_arc_intern_str() {
+        let s = ArcIntern::<str>::from("a");
+        let s = serde_json::to_string(&s).unwrap();
+        assert_eq!(s, "\"a\"");
     }
 
     #[test]
