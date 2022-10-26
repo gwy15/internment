@@ -39,7 +39,8 @@ impl<T: Copy> RefCount<[T]> {
 
             // SAFETY: valid for reads, writes, aligned and not overlapped.
             // and T is Copy, so don't worry about drop.
-            std::ptr::copy_nonoverlapping(slice.as_ptr(), &mut this.data[0], slice.len());
+            let dst = &mut this.data as *mut [T] as *mut T;
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), dst, slice.len());
             this
         }
     }
@@ -413,6 +414,14 @@ fn arc_intern_str() {
 }
 
 #[test]
+fn arc_intern_str_empty() {
+    let x = ArcIntern::<str>::from("");
+    assert_eq!(x.len(), 0);
+    assert_eq!(x.refcount(), 1);
+    assert_eq!(x, "");
+}
+
+#[test]
 fn zst_for_dst() {
     let vec = vec![(); 500];
     let x: ArcIntern<[()]> = ArcIntern::from(vec.clone());
@@ -442,7 +451,7 @@ fn dst_memory_aligned() {
             let ptr = unsafe { &*x.pointer.as_ptr() };
             // Arrays are laid out so that the zero-based nth element of the array is
             // offset from the start of the array by n * size_of::<T>() bytes.
-            let addr0 = &ptr.data[0] as *const _ as usize;
+            let addr0 = &ptr.data as *const [Aligned] as *const Aligned as usize;
             assert_eq!(addr0 % $align, 0);
             for idx in 1..10 {
                 let addr_offset = &ptr.data[idx] as *const _ as usize;
