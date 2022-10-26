@@ -306,6 +306,13 @@ fn dst_arc_intern_is_hash() {
 }
 
 #[test]
+fn dst_arc_intern_is_clone() {
+    struct _Assure
+    where
+        ArcIntern<str>: Clone;
+}
+
+#[test]
 fn dst_arc_intern_is_send_and_sync() {
     struct _Assure
     where

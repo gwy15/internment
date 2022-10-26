@@ -202,7 +202,7 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     }
 }
 
-impl<T: Eq + Hash + Send + Sync + 'static> Clone for ArcIntern<T> {
+impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> Clone for ArcIntern<T> {
     fn clone(&self) -> Self {
         // First increment the count.  Using a relaxed ordering is
         // alright here, as knowledge of the original reference
