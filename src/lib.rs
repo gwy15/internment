@@ -1,5 +1,4 @@
 #![deny(missing_docs)]
-#![cfg_attr(all(feature = "dst", feature = "arc"), feature(allocator_api))]
 // Copyright 2018,2020 David Roundy
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
@@ -75,6 +74,8 @@ pub use arena::ArenaIntern;
 
 #[cfg(feature = "arc")]
 mod arc;
+#[cfg(all(feature = "arc", feature = "dst"))]
+mod arc_dst;
 
 #[cfg(feature = "arc")]
 pub use arc::ArcIntern;

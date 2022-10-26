@@ -1,7 +1,7 @@
 #![deny(missing_docs)]
 use ahash::RandomState;
 use std::fmt::{Debug, Display, Pointer};
-type Container<T> = DashMap<BoxRefCount<T>, (), RandomState>;
+pub(crate) type Container<T> = DashMap<BoxRefCount<T>, (), RandomState>;
 type Untyped = Box<(dyn Any + Send + Sync + 'static)>;
 use std::borrow::Borrow;
 use std::convert::AsRef;
@@ -45,48 +45,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// ```
 #[cfg_attr(docsrs, doc(cfg(feature = "arc")))]
 pub struct ArcIntern<T: ?Sized + Eq + Hash + Send + Sync + 'static> {
-    pointer: std::ptr::NonNull<RefCount<T>>,
+    pub(crate) pointer: std::ptr::NonNull<RefCount<T>>,
 }
 
 unsafe impl<T: ?Sized + Eq + Hash + Send + Sync> Send for ArcIntern<T> {}
 unsafe impl<T: ?Sized + Eq + Hash + Send + Sync> Sync for ArcIntern<T> {}
 
 #[derive(Debug)]
-struct RefCount<T: ?Sized> {
-    count: AtomicUsize,
-    data: T,
-}
-
-#[cfg(feature = "dst")]
-impl<T: Copy> RefCount<[T]> {
-    fn from_slice(slice: &[T]) -> Box<RefCount<[T]>> {
-        use std::alloc::{Allocator, Layout};
-        let layout = Layout::new::<RefCount<()>>()
-            .extend(Layout::array::<T>(slice.len()).unwrap())
-            .unwrap()
-            .0
-            .pad_to_align();
-        let ptr = std::alloc::Global.allocate_zeroed(layout).unwrap();
-        let ptr = std::ptr::slice_from_raw_parts_mut(ptr.as_ptr() as *mut T, slice.len())
-            as *mut RefCount<[T]>;
-        let mut this = unsafe { Box::from_raw(ptr) };
-
-        this.count = AtomicUsize::new(1);
-        unsafe {
-            std::ptr::copy_nonoverlapping(slice.as_ptr(), &mut this.data[0] as *mut T, slice.len())
-        };
-        this
-    }
-}
-#[cfg(feature = "dst")]
-impl RefCount<str> {
-    fn from_str(s: &str) -> Box<RefCount<str>> {
-        let bytes = s.as_bytes();
-        let boxed_refcount = RefCount::<[u8]>::from_slice(bytes);
-        debug_assert_eq!(s.len(), boxed_refcount.data.len());
-
-        unsafe { Box::from_raw(Box::into_raw(boxed_refcount) as *mut RefCount<str>) }
-    }
+pub(crate) struct RefCount<T: ?Sized> {
+    pub(crate) count: AtomicUsize,
+    pub(crate) data: T,
 }
 
 impl<T: ?Sized + Eq> Eq for RefCount<T> {}
@@ -102,7 +70,7 @@ impl<T: ?Sized + Hash> Hash for RefCount<T> {
 }
 
 #[derive(Eq, PartialEq, Hash)]
-struct BoxRefCount<T: ?Sized>(Box<RefCount<T>>);
+pub(crate) struct BoxRefCount<T: ?Sized>(pub Box<RefCount<T>>);
 impl<T> BoxRefCount<T> {
     fn into_inner(self) -> T {
         self.0.data
@@ -130,7 +98,8 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     fn get_pointer(&self) -> *const RefCount<T> {
         self.pointer.as_ptr()
     }
-    fn get_container() -> dashmap::mapref::one::Ref<'static, TypeId, Untyped, RandomState> {
+    pub(crate) fn get_container() -> dashmap::mapref::one::Ref<'static, TypeId, Untyped, RandomState>
+    {
         use once_cell::sync::OnceCell;
         static ARC_CONTAINERS: OnceCell<DashMap<TypeId, Untyped, RandomState>> = OnceCell::new();
         let type_map = ARC_CONTAINERS.get_or_init(|| DashMap::with_hasher(RandomState::new()));
@@ -175,59 +144,6 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     /// Only for benchmarking, this will cause problems
     #[cfg(feature = "bench")]
     pub fn benchmarking_only_clear_interns() {}
-
-    /// make new [`ArcIntern`] with copyable initial value, like `&str` or `&[u8]`.
-    fn new_with_copyable_init_val<I, NewFn>(val: &I, new_fn: NewFn) -> ArcIntern<T>
-    where
-        I: ?Sized + Hash + std::cmp::Eq,
-        BoxRefCount<T>: Borrow<I>,
-        NewFn: Fn(&I) -> Box<RefCount<T>>,
-    {
-        // cache the converted BoxRefCount
-        let mut converted = None;
-        loop {
-            let c = Self::get_container();
-            let m = c.downcast_ref::<Container<T>>().unwrap();
-
-            if let Some(b) = m.get_mut(val) {
-                let b = b.key();
-                // First increment the count.  We are holding the write mutex here.
-                // Has to be the write mutex to avoid a race
-                let oldval = b.0.count.fetch_add(1, Ordering::SeqCst);
-                if oldval != 0 {
-                    // we can only use this value if the value is not about to be freed
-                    return ArcIntern {
-                        pointer: std::ptr::NonNull::from(b.0.borrow()),
-                    };
-                } else {
-                    // we have encountered a race condition here.
-                    // we will just wait for the object to finish
-                    // being freed.
-                    b.0.count.fetch_sub(1, Ordering::SeqCst);
-                }
-            } else {
-                let b = std::mem::take(&mut converted).unwrap_or_else(|| new_fn(val));
-                match m.entry(BoxRefCount(b)) {
-                    Entry::Vacant(e) => {
-                        // We can insert, all is good
-                        let p = ArcIntern {
-                            pointer: std::ptr::NonNull::from(e.key().0.borrow()),
-                        };
-                        e.insert(());
-                        return p;
-                    }
-                    Entry::Occupied(e) => {
-                        // Race, map already has data, go round again
-                        let box_ref_count = e.into_key();
-                        converted = Some(box_ref_count.0);
-                    }
-                }
-            }
-            // yield so that the object can finish being freed,
-            // and then we will be able to intern a new copy.
-            std::thread::yield_now();
-        }
-    }
 }
 
 impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
@@ -435,215 +351,6 @@ where
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         T::deserialize(deserializer).map(|x: T| Self::new(x))
-    }
-}
-
-#[cfg(feature = "dst")]
-mod dst {
-    use super::*;
-    impl From<&str> for ArcIntern<str> {
-        fn from(s: &str) -> Self {
-            ArcIntern::<str>::new_with_copyable_init_val(s, |s| RefCount::<str>::from_str(s))
-        }
-    }
-    impl From<String> for ArcIntern<str> {
-        fn from(s: String) -> Self {
-            Self::from(&s[..])
-        }
-    }
-    impl From<Box<str>> for ArcIntern<str> {
-        fn from(s: Box<str>) -> Self {
-            Self::from(&s[..])
-        }
-    }
-    impl Default for ArcIntern<str> {
-        fn default() -> Self {
-            Self::from("")
-        }
-    }
-
-    impl<T> From<&[T]> for ArcIntern<[T]>
-    where
-        T: Copy + Send + Sync + Hash + Eq + 'static,
-    {
-        fn from(slice: &[T]) -> Self {
-            ArcIntern::<[T]>::new_with_copyable_init_val(slice, |slice| {
-                RefCount::<[T]>::from_slice(slice)
-            })
-        }
-    }
-    // NOTE: we can do better by removing the `Copy` bound and
-    // copying the data without dropping `T`. See [`std::sync::Arc::from_box`]
-    impl<T> From<Vec<T>> for ArcIntern<[T]>
-    where
-        T: Copy + Send + Sync + Hash + Eq + 'static,
-    {
-        fn from(vec: Vec<T>) -> Self {
-            Self::from(&vec[..])
-        }
-    }
-    // NOTE: we can do better by removing the `Copy` bound and
-    // copying the data without dropping `T`. See [`std::sync::Arc::from_box`]
-    impl<T> From<Box<[T]>> for ArcIntern<[T]>
-    where
-        T: Copy + Send + Sync + Hash + Eq + 'static,
-    {
-        fn from(boxed_slice: Box<[T]>) -> Self {
-            Self::from(&boxed_slice[..])
-        }
-    }
-    impl<T> Default for ArcIntern<[T]>
-    where
-        T: Copy + Send + Sync + Hash + Eq + 'static,
-    {
-        fn default() -> Self {
-            Self::from(&[][..])
-        }
-    }
-
-    // implement some useful equal comparisons
-    macro_rules! impl_eq {
-        ([$($vars:tt)*] $lhs:ty, $rhs: ty) => {
-            #[allow(unused_lifetimes)]
-            impl<'a, $($vars)*> PartialEq<$rhs> for $lhs {
-                #[inline]
-                fn eq(&self, other: &$rhs) -> bool {
-                    PartialEq::eq(&self[..], &other[..])
-                }
-                #[inline]
-                fn ne(&self, other: &$rhs) -> bool {
-                    PartialEq::ne(&self[..], &other[..])
-                }
-            }
-
-            #[allow(unused_lifetimes)]
-            impl<'a, $($vars)*> PartialEq<$lhs> for $rhs {
-                #[inline]
-                fn eq(&self, other: &$lhs) -> bool {
-                    PartialEq::eq(&self[..], &other[..])
-                }
-                #[inline]
-                fn ne(&self, other: &$lhs) -> bool {
-                    PartialEq::ne(&self[..], &other[..])
-                }
-            }
-        };
-    }
-    impl_eq! { [] ArcIntern<str>, str }
-    impl_eq! { [] ArcIntern<str>, &'a str }
-    impl_eq! { [] ArcIntern<str>, String }
-    impl_eq! { [] ArcIntern<str>, std::borrow::Cow<'a, str> }
-    impl_eq! { [] ArcIntern<str>, Box<str> }
-    impl_eq! { [] ArcIntern<str>, std::rc::Rc<str> }
-    impl_eq! { [] ArcIntern<str>, std::sync::Arc<str> }
-    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, Vec<T> }
-    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, [T] }
-    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, &'a [T] }
-    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, &'a mut [T] }
-    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, std::borrow::Cow<'a, [T]> }
-    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, Box<[T]> }
-    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, std::rc::Rc<[T]> }
-    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static] ArcIntern<[T]>, std::sync::Arc<[T]> }
-    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static, const N: usize] ArcIntern<[T]>, [T; N] }
-    impl_eq! { [T: Copy + Send + Sync + Hash + Eq + 'static, const N: usize] ArcIntern<[T]>, &[T; N] }
-
-    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-    #[cfg(feature = "serde")]
-    impl<'de: 'a, 'a> Deserialize<'de> for ArcIntern<str> {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            let s: &'a str = <&str as Deserialize>::deserialize(deserializer)?;
-            Ok(Self::from(s))
-        }
-    }
-    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-    #[cfg(feature = "serde")]
-    impl<'de: 'a, 'a> Deserialize<'de> for ArcIntern<[u8]> {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            let slice = <&'a [u8] as Deserialize>::deserialize(deserializer)?;
-            Ok(Self::from(slice))
-        }
-    }
-
-    #[test]
-    fn dst_arc_intern_is_sized() {
-        struct _Assure
-        where
-            ArcIntern<str>: Sized;
-        struct _Assure2
-        where
-            ArcIntern<[u8]>: Sized;
-    }
-
-    #[test]
-    fn dst_arc_intern_is_hash() {
-        struct _Assure
-        where
-            ArcIntern<str>: Hash;
-    }
-
-    #[test]
-    fn dst_arc_intern_is_send_and_sync() {
-        struct _Assure
-        where
-            ArcIntern<str>: Send + Sync;
-    }
-
-    #[test]
-    fn common_equal_comparisons() {
-        let s1: ArcIntern<str> = ArcIntern::from("hello");
-        let s2: &str = "hello";
-        assert_eq!(s1, s2);
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn deserialize_arc_intern_str() {
-        let s = "\"a\"";
-        let mut deserializer = serde_json::Deserializer::from_str(s);
-        let s = <ArcIntern<str> as serde::Deserialize>::deserialize(&mut deserializer).unwrap();
-        assert_eq!(s, "a");
-        assert_eq!("a", s);
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serialize_arc_intern_str() {
-        let s = ArcIntern::<str>::from("a");
-        let s = serde_json::to_string(&s).unwrap();
-        assert_eq!(s, "\"a\"");
-    }
-
-    #[test]
-    fn arc_intern_str() {
-        let x: ArcIntern<str> = ArcIntern::from("hello");
-        assert_eq!(x.len(), 5);
-        assert_eq!(x.refcount(), 1);
-
-        let y: ArcIntern<str> = ArcIntern::from("hello");
-        assert_eq!(x.refcount(), 2);
-        assert_eq!(y.refcount(), 2);
-
-        assert_eq!(x.as_ptr(), y.as_ptr());
-        assert_eq!(x, y);
-
-        let z: ArcIntern<str> = ArcIntern::from(String::from("hello"));
-        assert_eq!(x.refcount(), 3);
-        assert_eq!(y.refcount(), 3);
-        assert_eq!(z.refcount(), 3);
-    }
-
-    #[test]
-    fn zst_for_dst() {
-        let vec = vec![(); 500];
-        let x: ArcIntern<[()]> = ArcIntern::from(vec.clone());
-        assert_eq!(x.len(), 500);
-        assert_eq!(x.refcount(), 1);
-
-        let y: ArcIntern<[()]> = ArcIntern::from(vec);
-        assert_eq!(x.refcount(), 2);
-        assert_eq!(y.refcount(), 2);
-
-        assert_eq!(x, y);
     }
 }
 
