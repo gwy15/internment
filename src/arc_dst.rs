@@ -35,11 +35,11 @@ impl<T: Copy> RefCount<[T]> {
             // of [`std::boxed`].
             let mut this = Box::from_raw(ptr);
 
-            std::ptr::write(&mut this.count as *mut _, AtomicUsize::new(1));
+            std::ptr::write(&mut this.count, AtomicUsize::new(1));
 
             // SAFETY: valid for reads, writes, aligned and not overlapped.
             // and T is Copy, so don't worry about drop.
-            std::ptr::copy_nonoverlapping(slice.as_ptr(), &mut this.data[0] as *mut T, slice.len());
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), &mut this.data[0], slice.len());
             this
         }
     }

@@ -74,7 +74,7 @@ pub use arena::ArenaIntern;
 
 #[cfg(feature = "arc")]
 mod arc;
-#[cfg(all(feature = "arc", feature = "dst"))]
+#[cfg(feature = "arc")]
 mod arc_dst;
 
 #[cfg(feature = "arc")]
