@@ -329,6 +329,23 @@ fn common_equal_comparisons() {
     assert_eq!(s1, s7);
 }
 
+#[test]
+fn common_from_conversions() {
+    let s1: ArcIntern<str> = ArcIntern::from("hello");
+    let s2: &str = "hello";
+    let s3: String = "hello".to_string();
+    let s4: std::borrow::Cow<'_, str> = "hello".into();
+    let s5: Box<str> = "hello".into();
+    let s6: std::rc::Rc<str> = "hello".into();
+    let s7: std::sync::Arc<str> = "hello".into();
+    assert_eq!(ArcIntern::from(s2), s1);
+    assert_eq!(ArcIntern::from(s3), s1);
+    assert_eq!(ArcIntern::from(s4), s1);
+    assert_eq!(ArcIntern::from(s5), s1);
+    assert_eq!(ArcIntern::from(s6), s1);
+    assert_eq!(ArcIntern::from(s7), s1);
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn deserialize_arc_intern_str() {
