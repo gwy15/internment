@@ -313,6 +313,16 @@ fn dst_arc_intern_is_clone() {
 }
 
 #[test]
+fn dst_arc_intern_is_borrow() {
+    // demonstrate that Arc has this ability
+    let map = std::collections::HashMap::<std::sync::Arc<str>, u32>::new();
+    assert!(map.get("dst_arc_intern_is_borrow").is_none());
+
+    let map = std::collections::HashMap::<ArcIntern<str>, u32>::new();
+    assert!(map.get("dst_arc_intern_is_borrow").is_none());
+}
+
+#[test]
 fn dst_arc_intern_is_send_and_sync() {
     struct _Assure
     where
@@ -321,13 +331,13 @@ fn dst_arc_intern_is_send_and_sync() {
 
 #[test]
 fn common_equal_comparisons() {
-    let s1: ArcIntern<str> = ArcIntern::from("hello");
-    let s2: &str = "hello";
-    let s3: String = "hello".to_string();
-    let s4: std::borrow::Cow<'_, str> = "hello".into();
-    let s5: Box<str> = "hello".into();
-    let s6: std::rc::Rc<str> = "hello".into();
-    let s7: std::sync::Arc<str> = "hello".into();
+    let s1: ArcIntern<str> = ArcIntern::from("common_equal_comparisons");
+    let s2: &str = "common_equal_comparisons";
+    let s3: String = "common_equal_comparisons".to_string();
+    let s4: std::borrow::Cow<'_, str> = "common_equal_comparisons".into();
+    let s5: Box<str> = "common_equal_comparisons".into();
+    let s6: std::rc::Rc<str> = "common_equal_comparisons".into();
+    let s7: std::sync::Arc<str> = "common_equal_comparisons".into();
     assert_eq!(s1, s2);
     assert_eq!(s1, s3);
     assert_eq!(s1, s4);
@@ -338,13 +348,13 @@ fn common_equal_comparisons() {
 
 #[test]
 fn common_from_conversions() {
-    let s1: ArcIntern<str> = ArcIntern::from("hello");
-    let s2: &str = "hello";
-    let s3: String = "hello".to_string();
-    let s4: std::borrow::Cow<'_, str> = "hello".into();
-    let s5: Box<str> = "hello".into();
-    let s6: std::rc::Rc<str> = "hello".into();
-    let s7: std::sync::Arc<str> = "hello".into();
+    let s1: ArcIntern<str> = ArcIntern::from("common_from_conversions");
+    let s2: &str = "common_from_conversions";
+    let s3: String = "common_from_conversions".to_string();
+    let s4: std::borrow::Cow<'_, str> = "common_from_conversions".into();
+    let s5: Box<str> = "common_from_conversions".into();
+    let s6: std::rc::Rc<str> = "common_from_conversions".into();
+    let s7: std::sync::Arc<str> = "common_from_conversions".into();
     assert_eq!(ArcIntern::from(s2), s1);
     assert_eq!(ArcIntern::from(s3), s1);
     assert_eq!(ArcIntern::from(s4), s1);
@@ -394,6 +404,12 @@ fn arc_intern_str() {
     assert_eq!(x.refcount(), 3);
     assert_eq!(y.refcount(), 3);
     assert_eq!(z.refcount(), 3);
+
+    std::mem::drop(x);
+    assert_eq!(y.refcount(), 2);
+    assert_eq!(z.refcount(), 2);
+    std::mem::drop(y);
+    assert_eq!(z.refcount(), 1);
 }
 
 #[test]
