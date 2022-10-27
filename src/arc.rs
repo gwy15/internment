@@ -1,21 +1,23 @@
 #![deny(missing_docs)]
-use ahash::RandomState;
-use std::fmt::{Debug, Display, Pointer};
-pub(crate) type Container<T> = DashMap<BoxRefCount<T>, (), RandomState>;
-type Untyped = Box<(dyn Any + Send + Sync + 'static)>;
-use std::borrow::Borrow;
-use std::convert::AsRef;
-use std::hash::{Hash, Hasher};
-use std::ops::Deref;
-
-use dashmap::{mapref::entry::Entry, DashMap};
 use std::any::Any;
 use std::any::TypeId;
+use std::borrow::Borrow;
+use std::convert::AsRef;
+use std::fmt::{Debug, Display, Pointer};
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use ahash::RandomState;
+use dashmap::{mapref::entry::Entry, DashMap};
+use once_cell::sync::OnceCell;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+type Container<T> = DashMap<BoxRefCount<T>, (), RandomState>;
 
 /// A pointer to a reference-counted interned object.
 ///
@@ -98,21 +100,50 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     fn get_pointer(&self) -> *const RefCount<T> {
         self.pointer.as_ptr()
     }
-    pub(crate) fn get_container() -> dashmap::mapref::one::Ref<'static, TypeId, Untyped, RandomState>
-    {
-        use once_cell::sync::OnceCell;
-        static ARC_CONTAINERS: OnceCell<DashMap<TypeId, Untyped, RandomState>> = OnceCell::new();
+    pub(crate) fn get_container() -> &'static Container<T> {
+        // make some shortcuts, this should be optimized away by compiler for types that are not matched.
+        // for matched types, this completely avoids the need to look up dashmap.
+        macro_rules! common_containers {
+            ($($t:ty),*) => {
+                $(
+                if TypeId::of::<T>() == TypeId::of::<$t>() {
+                    static CONTAINER: OnceCell<Container<$t>> = OnceCell::new();
+                    let c: &'static Container<$t> = CONTAINER.get_or_init(|| Container::with_hasher(RandomState::new()));
+                    // SAFETY: we just compared to make sure `T` == `$t`. This converts Container<$t> to Container<T>
+                    // to make the compiler happy.
+                    return unsafe { &*(c as *const _ as usize as *const Container<T>) };
+                }
+                )*
+            };
+        }
+        common_containers!(str, String);
+
+        // The static container stored on heap that is never dropped or moved.
+        // Once created, it is safe to get a static reference to it.
+        type UntypedContainer = Pin<Box<(dyn Any + Send + Sync + 'static)>>;
+
+        static ARC_CONTAINERS: OnceCell<DashMap<TypeId, UntypedContainer, RandomState>> =
+            OnceCell::new();
         let type_map = ARC_CONTAINERS.get_or_init(|| DashMap::with_hasher(RandomState::new()));
         // Prefer taking the read lock to reduce contention, only use entry api if necessary.
-        let boxed = if let Some(boxed) = type_map.get(&TypeId::of::<T>()) {
-            boxed
-        } else {
-            type_map
-                .entry(TypeId::of::<T>())
-                .or_insert_with(|| Box::new(Container::<T>::with_hasher(RandomState::new())))
-                .downgrade()
-        };
-        boxed
+        let boxed: dashmap::mapref::one::Ref<'static, TypeId, UntypedContainer, _> =
+            if let Some(boxed) = type_map.get(&TypeId::of::<T>()) {
+                boxed
+            } else {
+                type_map
+                    .entry(TypeId::of::<T>())
+                    .or_insert_with(|| Box::pin(Container::<T>::with_hasher(RandomState::new())))
+                    .downgrade()
+            };
+        // SAFETY: downcast should never fail, as we only insert containers of type T.
+        let short_lived = boxed.downcast_ref::<Container<T>>().unwrap();
+        // SAFETY: it is safe to convert short_lived to long_lived because
+        // `ARC_CONTAINERS` is a static variable and it *never removes* any entry.
+        // So each value (`Box<Container>`) lives statically.
+        // Also, dashmap reallocate only moves the pointers to container, not the actual container
+        // (we made the value `Pin<Box<>>` to ensure this).
+        let long_lived: &'static _ = unsafe { &*(short_lived as *const _) };
+        long_lived
     }
 
     /// Intern a value from a reference with atomic reference counting.
@@ -131,10 +162,7 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     /// See how many objects have been interned.  This may be helpful
     /// in analyzing memory use.
     pub fn num_objects_interned() -> usize {
-        let c = Self::get_container();
-        c.downcast_ref::<Container<T>>()
-            .map(|m| m.len())
-            .unwrap_or(0)
+        Self::get_container().len()
     }
     /// Return the number of counts for this pointer.
     pub fn refcount(&self) -> usize {
@@ -156,8 +184,7 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     /// a `DashMap` which is protected by internal sharded locks.
     pub fn new(mut val: T) -> ArcIntern<T> {
         loop {
-            let c = Self::get_container();
-            let m = c.downcast_ref::<Container<T>>().unwrap();
+            let m = Self::get_container();
             if let Some(b) = m.get_mut(&val) {
                 let b = b.key();
                 // First increment the count.  We are holding the write mutex here.
@@ -250,8 +277,7 @@ impl<T: ?Sized + Eq + Hash + Send + Sync> Drop for ArcIntern<T> {
             // dropped *before* the removed content is dropped, since it
             // might need to lock the mutex.
             let _remove;
-            let c = Self::get_container();
-            let m = c.downcast_ref::<Container<T>>().unwrap();
+            let m = Self::get_container();
             _remove = m.remove(unsafe { self.pointer.as_ref() });
         }
     }

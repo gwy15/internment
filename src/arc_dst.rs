@@ -13,7 +13,7 @@ use dashmap::mapref::entry::Entry;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer};
 
-use super::arc::{ArcIntern, BoxRefCount, Container, RefCount};
+use super::arc::{ArcIntern, BoxRefCount, RefCount};
 
 impl<T: Copy> RefCount<[T]> {
     fn from_slice(slice: &[T]) -> Box<RefCount<[T]>> {
@@ -68,8 +68,7 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
         // cache the converted BoxRefCount to avoid copy. This only takes an usize.
         let mut converted = None;
         loop {
-            let c = Self::get_container();
-            let m = c.downcast_ref::<Container<T>>().unwrap();
+            let m = Self::get_container();
 
             if let Some(b) = m.get_mut(val) {
                 let b = b.key();
