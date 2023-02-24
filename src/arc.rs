@@ -165,6 +165,46 @@ impl<T: ?Sized + Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     /// Only for benchmarking, this will cause problems
     #[cfg(feature = "bench")]
     pub fn benchmarking_only_clear_interns() {}
+
+    /// Creates an iterator over the interned values.
+    pub fn iter() -> Iter<'static, T> {
+        let container = Self::get_container();
+        Iter {
+            inner: container.iter(),
+        }
+    }
+}
+
+pub struct Iter<'a, T: ?Sized> {
+    inner: dashmap::iter::Iter<'a, BoxRefCount<T>, (), RandomState>,
+}
+pub struct IterItem<'a, T>
+where
+    T: ?Sized + Eq + Hash + Send + Sync + 'static,
+{
+    inner: dashmap::mapref::multiple::RefMulti<'a, BoxRefCount<T>, (), RandomState>,
+}
+impl<'a, T> IterItem<'a, T>
+where
+    T: ?Sized + Eq + Hash + Send + Sync + 'static,
+{
+    pub fn count(&self) -> usize {
+        self.inner.key().0.count.load(Ordering::Acquire)
+    }
+    pub fn value(&'a self) -> &'a T {
+        &self.inner.key().0.data
+    }
+}
+
+impl<'a, T> Iterator for Iter<'a, T>
+where
+    T: ?Sized + Eq + Hash + Send + Sync + 'static,
+{
+    type Item = IterItem<'a, T>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let inner = self.inner.next()?;
+        return Some(IterItem { inner });
+    }
 }
 
 impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
